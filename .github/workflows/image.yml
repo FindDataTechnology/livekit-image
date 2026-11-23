@@ -1,0 +1,141 @@
+# Re-host LiveKit server onto the org's own registry chain.
+#
+# Same shape as mattermost-image's workflow (the reference implementation):
+# GitHub Actions -> hkccr (Hong Kong) -> cheap9 relay -> ccr (Guangzhou).
+# Cluster nodes pull from ccr. Pushing to ccr directly from a dev machine only
+# has read credentials — the write happens here, with the org's robot token.
+#
+# LiveKit's image is small (~60MB) and multi-arch, so unlike mattermost there is
+# no giant single layer to split. The sanity checks are still kept: a re-host
+# that changed the image is a re-host that broke it.
+name: image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# QUEUED, not cancelling: a cancelled build can leave a half-written tag, and
+# this repo is the mirror's only build path.
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: hkccr.ccs.tencentyun.com
+  # fd-web already hosts third-party re-hosted images (official-web, mattermost).
+  NAMESPACE: fd-web
+  IMAGE_NAME: livekit-server
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.TCR_USER }}
+          password: ${{ secrets.TCR_PASS }}
+
+      # The upstream tag IS the identity, so read it from the Dockerfile so the
+      # tag cannot drift from the content.
+      - id: upstream
+        name: Read the pinned upstream tag from the Dockerfile
+        run: |
+          set -euo pipefail
+          line=$(grep -E '^FROM ' Dockerfile | head -1)
+          ref=$(echo "${line#FROM }" | sed -E 's/^ +//; s/ +AS +.*$//')
+          version=${ref##*:}
+          [ "$version" != "$ref" ] || { echo "::error::Dockerfile has no pinned tag (got '$ref')"; exit 1; }
+          case "$version" in
+            latest|*"*"*) echo "::error::refusing floating tag '$version'"; exit 1;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Pinned upstream version: $version"
+
+      - id: prev
+        name: Read current digest on main (content baseline)
+        run: |
+          img="${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}"
+          cur=$(docker buildx imagetools inspect "$img:main" \
+                --format '{{.Manifest.Digest}}' 2>/dev/null || true)
+          echo "digest=$cur" >> "$GITHUB_OUTPUT"
+          echo "current main digest: ${cur:-<none, first build>}"
+
+      - name: Build (load, no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          provenance: false
+          tags: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.upstream.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A re-host that changed the image is a re-host that broke it. The binary
+      # is statically linked Go on alpine, so "it runs" is a real check that the
+      # COPY path is right.
+      - name: Sanity — the binary runs on the new base
+        run: |
+          set -euo pipefail
+          img="${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.upstream.outputs.version }}"
+          out=$(docker run --rm --entrypoint /usr/local/bin/livekit-server "$img" --version 2>&1) || {
+            echo "::error::livekit-server failed to run on the new base"
+            echo "$out" | tail -20
+            exit 1
+          }
+          echo "$out"
+          case "$out" in
+            *"${{ steps.upstream.outputs.version }}"*) echo "version matches the pin";;
+            *) echo "::error::image reports '$out' but Dockerfile pins '${{ steps.upstream.outputs.version }}'"; exit 1;;
+          esac
+
+      - name: Push to hkccr
+        run: |
+          img="${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}"
+          docker push "$img:${{ steps.upstream.outputs.version }}"
+          # The relay's ledger is keyed on repo:tag and will NOT re-push a tag it
+          # already synced even when content changed (observed 2026-11-19). A
+          # fresh tag name is first-seen, which the relay does carry.
+          docker tag "$img:${{ steps.upstream.outputs.version }}" "$img:${{ steps.upstream.outputs.version }}-split2"
+          docker push "$img:${{ steps.upstream.outputs.version }}-split2"
+          docker tag "$img:${{ steps.upstream.outputs.version }}" "$img:main"
+          docker push "$img:main"
+
+      - name: Report what landed
+        env:
+          OLD: ${{ steps.prev.outputs.digest }}
+        run: |
+          set -euo pipefail
+          img="${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}"
+          NEW=$(docker buildx imagetools inspect "$img:${{ steps.upstream.outputs.version }}" \
+                --format '{{.Manifest.Digest}}' 2>/dev/null || true)
+          [ -n "$NEW" ] || { echo "::error::registry reports no digest for the pushed tag"; exit 1; }
+          {
+            echo "## re-hosted -> hkccr"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| image | \`$img:${{ steps.upstream.outputs.version }}\` (+ :main) |"
+            echo "| digest | \`$NEW\` |"
+            echo "| previous main digest | \`${OLD:-<none>}\` |"
+            echo ""
+            echo "**Next:** relay lands it on ccr within <=5 min, then verify FROM A CLUSTER NODE:"
+            echo ""
+            echo '```'
+            echo "k3s ctr -n k8s.io images pull ccr.ccs.tencentyun.com/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.upstream.outputs.version }}"
+            echo '```'
+            echo ""
+            echo "A green workflow is not evidence the cluster can pull it."
+          } >> "$GITHUB_STEP_SUMMARY"
