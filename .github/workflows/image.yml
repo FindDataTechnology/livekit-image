@@ -96,8 +96,11 @@ jobs:
             exit 1
           }
           echo "$out"
+          # Upstream's binary prints "livekit-server version 1.13.11" while the
+          # Docker tag carries a leading `v`. Compare on the numeric core.
+          want="${{ steps.upstream.outputs.version }}"; want="${want#v}"
           case "$out" in
-            *"${{ steps.upstream.outputs.version }}"*) echo "version matches the pin";;
+            *"$want"*) echo "version matches the pin ($want)";;
             *) echo "::error::image reports '$out' but Dockerfile pins '${{ steps.upstream.outputs.version }}'"; exit 1;;
           esac
 
