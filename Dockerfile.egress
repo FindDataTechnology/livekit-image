@@ -1,0 +1,23 @@
+# LiveKit Egress, re-hosted onto the org's registry chain.
+#
+# WHY THIS IS A STRAIGHT RE-TAG AND NOT A COPY LIKE THE SERVER:
+# Egress is not a static Go binary. It needs GStreamer, the Chrome runtime and
+# the composition templates that live beside it in the upstream image (~1.5GB).
+# Copying "the binary" into alpine — the trick that keeps livekit-server tiny —
+# would produce an image that starts and then fails on the first egress.
+# So this pins the upstream image and adds only provenance labels. The win is
+# not size, it is that cluster nodes can pull it from ccr at all: they cannot
+# reach docker.io (measured 2026-11-24, cheap-3 skopeo → registry-1.docker.io
+# i/o timeout).
+#
+# v1.15.0 specifically: it closes CVE-2026-85046 and CVE-2026-87491, two V8
+# RCEs exploited in the wild. Egress runs Chrome UNSANDBOXED unless
+# enable_chrome_sandbox is set, so an older tag is a live risk on this box even
+# though this deployment only ever feeds it our own LiveKit rooms.
+FROM livekit/egress:v1.15.0
+
+# Provenance only — no behaviour change.
+LABEL org.opencontainers.image.source="https://github.com/FindDataTechnology/livekit-image" \
+      org.opencontainers.image.title="livekit-egress" \
+      org.opencontainers.image.description="LiveKit Egress v1.15.0, re-hosted for the ccr pull path" \
+      org.opencontainers.image.vendor="FindDataTechnology"

@@ -1,0 +1,142 @@
+# Re-host LiveKit Egress onto the org's registry chain.
+#
+# Same chain as the server image: GitHub Actions -> hkccr (Hong Kong) ->
+# cheap9 relay -> ccr (Guangzhou). Nodes pull from ccr; they cannot reach
+# docker.io at all.
+#
+# WHY A SEPARATE WORKFLOW RATHER THAN A MATRIX ENTRY:
+# the two images have different sanity checks and different sizes (egress is
+# ~1.5GB with its runtime baked in). A matrix would hide the difference that
+# matters — the server is COPY-ed onto alpine and verified by running the
+# binary; egress is re-tagged whole and can only be verified by starting it.
+name: image-egress
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile.egress"
+      - ".github/workflows/image-egress.yml"
+  workflow_dispatch:
+
+# QUEUED, not cancelling: a cancelled build can leave a half-written tag.
+concurrency:
+  group: image-egress-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: hkccr.ccs.tencentyun.com
+  NAMESPACE: fd-web
+  IMAGE_NAME: livekit-egress
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.TCR_USER }}
+          password: ${{ secrets.TCR_PASS }}
+
+      # The upstream tag IS the identity. Read it from the Dockerfile so the tag
+      # cannot drift from the content, and refuse anything floating.
+      - id: upstream
+        name: Read the pinned upstream tag from Dockerfile.egress
+        run: |
+          set -euo pipefail
+          line=$(grep -E '^FROM ' Dockerfile.egress | head -1)
+          ref=$(echo "${line#FROM }" | sed -E 's/^ +//; s/ +AS +.*$//')
+          version=${ref##*:}
+          [ "$version" != "$ref" ] || { echo "::error::Dockerfile.egress has no pinned tag (got '$ref')"; exit 1; }
+          case "$version" in
+            latest|main|*"*"*) echo "::error::refusing floating tag '$version'"; exit 1;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Pinned upstream version: $version"
+
+      - id: prev
+        name: Read current digest on main (content baseline)
+        run: |
+          img="${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}"
+          cur=$(docker buildx imagetools inspect "$img:main" \
+                --format '{{.Manifest.Digest}}' 2>/dev/null || true)
+          echo "digest=$cur" >> "$GITHUB_OUTPUT"
+          echo "current main digest: ${cur:-<none, first build>}"
+
+      - name: Build (load, no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.egress
+          platforms: linux/amd64
+          push: false
+          load: true
+          provenance: false
+          tags: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.upstream.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A re-tag that changed the image is a re-tag that broke it. Egress has no
+      # --version flag, so the check is "the binary starts and the image still
+      # carries the runtime it needs": the binary is at /bin/egress and the
+      # transcode runtime is GStreamer (upstream builds it in, and its own CI
+      # gates on `gst-inspect-1.0`). Both are exactly what a wrong base loses.
+      - name: Sanity — the egress binary and its transcode runtime are present
+        run: |
+          set -euo pipefail
+          img="${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.upstream.outputs.version }}"
+          echo "--- the binary runs ---"
+          out=$(docker run --rm --entrypoint /bin/egress "$img" --help 2>&1) || {
+            echo "::error::/bin/egress failed to start"
+            echo "$out" | tail -30
+            exit 1
+          }
+          echo "$out" | head -12
+          echo "--- gstreamer present ---"
+          docker run --rm --entrypoint sh "$img" -c 'command -v gst-inspect-1.0' || {
+            echo "::error::gst-inspect-1.0 missing — the re-tag lost the transcode runtime"
+            exit 1
+          }
+
+      - name: Push to hkccr
+        run: |
+          img="${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}"
+          docker push "$img:${{ steps.upstream.outputs.version }}"
+          # The relay's ledger is keyed on repo:tag and will NOT re-push a tag it
+          # already synced even when content changed. A fresh tag name is
+          # first-seen, which the relay does carry.
+          docker tag "$img:${{ steps.upstream.outputs.version }}" "$img:${{ steps.upstream.outputs.version }}-split2"
+          docker push "$img:${{ steps.upstream.outputs.version }}-split2"
+          docker tag "$img:${{ steps.upstream.outputs.version }}" "$img:main"
+          docker push "$img:main"
+
+      - name: Report what landed
+        env:
+          OLD: ${{ steps.prev.outputs.digest }}
+        run: |
+          set -euo pipefail
+          img="${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}"
+          NEW=$(docker buildx imagetools inspect "$img:${{ steps.upstream.outputs.version }}" \
+                --format '{{.Manifest.Digest}}' 2>/dev/null || true)
+          [ -n "$NEW" ] || { echo "::error::registry reports no digest for the pushed tag"; exit 1; }
+          {
+            echo "## egress re-hosted -> hkccr"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| image | \`$img:${{ steps.upstream.outputs.version }}\` (+ :main) |"
+            echo "| digest | \`$NEW\` |"
+            echo "| previous main digest | \`${OLD:-<none>}\` |"
+            echo ""
+            echo "**Next:** relay lands it on ccr within <=5 min; the deployment"
+            echo "pins \`ccr.ccs.tencentyun.com/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
